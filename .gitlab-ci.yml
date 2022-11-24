@@ -1,0 +1,161 @@
+variables:
+  IMAGE_NAME: $PROJECT_NAME
+  ENVIRONMENT: 'production'
+  PLAN: plan.tfplan
+  DOCKER_HOST: 'tcp://docker:2375'
+  DOCKER_REGISTRY: 325427326730.dkr.ecr.eu-west-1.amazonaws.com
+  DOCKER_TLS_CERTDIR: ''
+
+# This will help us to distinguish between a staging and production deployment
+# It will check the commit message for `staging` or `production` presebce
+workflow:
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /\[staging]/
+      variables:
+        ENVIRONMENT: 'staging'
+    - when: always
+
+# Avoid duplication and maintain DRY
+.compile_terraform_stage:
+  image:
+    name: hashicorp/terraform:latest
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+# Avoid duplication and maintain DRY
+.setup-terraform: &setup-terraform
+  - export AWS_ACCESS_KEY=${AWS_ACCESS_KEY_ID}
+  - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+  - rm -rf .terraform
+  - terraform --version
+  - terraform init
+
+# Avoid duplication and maintain DRY
+.setup-aws: &setup-aws
+  - python3 -m pip install install awscli
+  - aws --version
+  - echo "===> Configuring AWS"
+  - aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
+  - aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
+  - aws configure set region "$AWS_DEFAULT_REGION"
+
+# Avoid duplication and maintain DRY
+.install-aws: &install-aws
+  - yum install -y curl jq python3 python3-pip
+  - *setup-aws
+
+# Avoid duplication and maintain DRY
+.install-aws-plan: &install-aws-plan
+  - apk add --no-cache curl jq python3 py3-pip
+  - *setup-aws
+
+# Define the stages we will be using in this build
+stages:
+  - build
+  - validate
+  - plan
+  - apply
+
+build:
+  stage: build
+  environment: $ENVIRONMENT
+  image:
+    name: amazon/aws-cli
+    entrypoint: ['']
+  services:
+    - docker:dind
+  before_script:
+    - amazon-linux-extras install docker
+    - aws --version
+    - docker --version
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $DOCKER_REGISTRY
+    - *install-aws
+  # This script creates or gets the repository that we will be pushing the image to
+  # It also creates variables that will be used by Terraform during the apply stage
+  script:
+    - echo "===> Creating repository"
+    - chmod +x .ci/aws/ecr/ecr.sh
+    - REPOSITORY_URI=`sh .ci/aws/ecr/ecr.sh`
+    - echo ${REPOSITORY_URI}
+    - echo "===> Starting build"
+    - docker build
+      --build-arg SERVER_BACKEND_HOST="$SERVER_BACKEND_HOST"
+      --build-arg SERVER_BACKEND_PORT="$SERVER_BACKEND_PORT"
+      --build-arg SERVER_BACKEND_NAME="$SERVER_BACKEND_NAME"
+      --build-arg SERVER_BACKEND_API_PREFIX="$SERVER_BACKEND_API_PREFIX"
+      --build-arg SERVER_BACKEND_PROTOCOL="$SERVER_BACKEND_PROTOCOL"
+      --build-arg SERVER_BACKEND_DB_URL="$SERVER_BACKEND_DB_URL"
+      --build-arg NODE_ENV="$NODE_ENV"
+      -t "${REPOSITORY_URI}:${CI_COMMIT_SHORT_SHA}" .
+    - echo "===> Tagging image(s)"
+    - docker tag "${REPOSITORY_URI}:${CI_COMMIT_SHORT_SHA}" "${REPOSITORY_URI}:latest"
+    - echo "===> Pushing image(s)"
+    - docker push "${REPOSITORY_URI}:latest"
+    - docker push "${REPOSITORY_URI}:${CI_COMMIT_SHORT_SHA}"
+    - echo "===> Cleaning up image(s)"
+    - docker rmi "${REPOSITORY_URI}:latest" --force
+    - docker rmi "${REPOSITORY_URI}:${CI_COMMIT_SHORT_SHA}" --force
+    - echo "===> Exporting repository URL"
+    - printf "TF_VAR_ecr_repository_uri=${REPOSITORY_URI}\nTF_VAR_ecs_image_tag=${CI_COMMIT_SHORT_SHA}\nTF_VAR_project_name=${PROJECT_NAME}\nTF_VAR_app_domain=api.${PROJECT_NAME}.${NODE_ENV}" >> build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+  only:
+    variables:
+      - $CI_COMMIT_MESSAGE =~ /\[build]/
+
+validate:
+  environment: $ENVIRONMENT
+  extends:
+    - .compile_terraform_stage
+  stage: validate
+  script:
+    - echo "=== Validating infrastructure ==="
+    - cd ${CI_PROJECT_DIR}/infrastructure/terraform/${ENVIRONMENT}
+    - *setup-terraform
+    - terraform validate
+  only:
+    variables:
+      - $CI_COMMIT_MESSAGE =~ /\[deploy]/
+
+plan:
+  environment: $ENVIRONMENT
+  extends:
+    - .compile_terraform_stage
+  stage: plan
+  # Push the environment variables to s3
+  before_script:
+    - *install-aws-plan
+    - echo "===> Pushing vars to S3"
+    - aws s3 cp "${ENV_FILE}" s3://stolets-ecs-env-vars-bucket/${PROJECT_NAME}/${ENVIRONMENT}/vars.env
+  script:
+    - echo "===> Planning infrastructure state"
+    - cd ${CI_PROJECT_DIR}/infrastructure/terraform/${ENVIRONMENT}
+    - *setup-terraform
+    - terraform plan -out=$PLAN
+    - terraform show --json $PLAN
+  dependencies:
+    - build
+    - validate
+  artifacts:
+    paths:
+      - ${CI_PROJECT_DIR}/infrastructure/terraform/${ENVIRONMENT}/$PLAN
+  only:
+    variables:
+      - $CI_COMMIT_MESSAGE =~ /\[deploy]/
+
+apply:
+  extends:
+    - .compile_terraform_stage
+  stage: apply
+  script:
+    - echo "===> Applying infrastructure state"
+    - cd ${CI_PROJECT_DIR}/infrastructure/terraform/${ENVIRONMENT}
+    - *setup-terraform
+    - terraform apply -input=false $PLAN
+  dependencies:
+    - plan
+  only:
+    variables:
+      - $CI_COMMIT_MESSAGE =~ /\[deploy]/
